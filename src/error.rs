@@ -1,4 +1,3 @@
-//src\error.rs
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -17,7 +16,12 @@ pub enum WebauthnError {
     UserHasNoCredentials,
     #[error("Deserialising Session failed: {0}")]
     InvalidSessionState(#[from] tower_sessions::session::Error),
+    #[error("MongoDB error: {0}")]
+    MongoDBError(#[from] mongodb::error::Error),
+    #[error("BSON serialization error: {0}")]
+    BsonError(#[from] mongodb::bson::ser::Error), // Add this
 }
+
 impl IntoResponse for WebauthnError {
     fn into_response(self) -> Response {
         let body = match self {
@@ -26,9 +30,9 @@ impl IntoResponse for WebauthnError {
             WebauthnError::Unknown => "Unknown Error",
             WebauthnError::UserHasNoCredentials => "User Has No Credentials",
             WebauthnError::InvalidSessionState(_) => "Deserialising Session failed",
+            WebauthnError::MongoDBError(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            WebauthnError::BsonError(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };
-
-        // its often easiest to implement `IntoResponse` by calling other implementations
         (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
     }
 }

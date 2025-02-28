@@ -1,92 +1,45 @@
-//src\auth.rs
 use crate::error::WebauthnError;
-use crate::startup::AppState;
+use crate::startup::{AppState, UserData};
 use axum::{
     extract::{Extension, Json, Path},
     http::StatusCode,
     response::IntoResponse,
 };
 use tower_sessions::Session;
-
-/*
- * Webauthn RS auth handlers.
- * These files use webauthn to process the data received from each route, and are closely tied to axum
- */
-
-// 1. Import the prelude - this contains everything needed for the server to function.
 use webauthn_rs::prelude::*;
-
-// 2. The first step a client (user) will carry out is requesting a credential to be
-// registered. We need to provide a challenge for this. The work flow will be:
-//
-//          ┌───────────────┐     ┌───────────────┐      ┌───────────────┐
-//          │ Authenticator │     │    Browser    │      │     Site      │
-//          └───────────────┘     └───────────────┘      └───────────────┘
-//                  │                     │                      │
-//                  │                     │     1. Start Reg     │
-//                  │                     │─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─▶│
-//                  │                     │                      │
-//                  │                     │     2. Challenge     │
-//                  │                     │◀ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┤
-//                  │                     │                      │
-//                  │  3. Select Token    │                      │
-//             ─ ─ ─│◀ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─│                      │
-//  4. Verify │     │                     │                      │
-//                  │  4. Yield PubKey    │                      │
-//            └ ─ ─▶│─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─▶                      │
-//                  │                     │                      │
-//                  │                     │  5. Send Reg Opts    │
-//                  │                     │─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─▶│─ ─ ─
-//                  │                     │                      │     │ 5. Verify
-//                  │                     │                      │         PubKey
-//                  │                     │                      │◀─ ─ ┘
-//                  │                     │                      │─ ─ ─
-//                  │                     │                      │     │ 6. Persist
-//                  │                     │                      │       Credential
-//                  │                     │                      │◀─ ─ ┘
-//                  │                     │                      │
-//                  │                     │                      │
-//
-// In this step, we are responding to the start reg(istration) request, and providing
-// the challenge to the browser.
+use mongodb::bson::doc;
 
 pub async fn start_register(
     Extension(app_state): Extension<AppState>,
     session: Session,
     Path(username): Path<String>,
 ) -> Result<impl IntoResponse, WebauthnError> {
-    info!("Start register");
-    // We get the username from the URL, but you could get this via form submission or
-    // some other process. In some parts of Webauthn, you could also use this as a "display name"
-    // instead of a username. Generally you should consider that the user *can* and *will* change
-    // their username at any time.
+    info!("Start register for username: {}", username);
 
-    // Since a user's username could change at anytime, we need to bind to a unique id.
-    // We use uuid's for this purpose, and you should generate these randomly. If the
-    // username does exist and is found, we can match back to our unique id. This is
-    // important in authentication, where presented credentials may *only* provide
-    // the unique id, and not the username!
+    let user_unique_id = Uuid::new_v4();
 
-    let user_unique_id = {
-        let users_guard = app_state.users.lock().await;
-        users_guard
-            .name_to_id
-            .get(&username)
-            .copied()
-            .unwrap_or_else(Uuid::new_v4)
-    };
+    if let Err(e) = session.remove_value("reg_state").await {
+        error!("Failed to remove previous reg_state from session: {:?}", e);
+    } else {
+        info!("Cleared previous reg_state from session");
+    }
 
-    // Remove any previous registrations that may have occured from the session.
-    let _ = session.remove_value("reg_state").await;
-
-    // If the user has any other credentials, we exclude these here so they can't be duplicate registered.
-    // It also hints to the browser that only new credentials should be "blinked" for interaction.
-    let exclude_credentials = {
-        let users_guard = app_state.users.lock().await;
-        users_guard
-            .keys
-            .get(&user_unique_id)
-            .map(|keys| keys.iter().map(|sk| sk.cred_id().clone()).collect())
+    let exclude_credentials: Option<Vec<CredentialID>> = {
+        let collection = app_state.users_collection();
+        match collection.find_one(doc! { "username": &username }).await {
+            Ok(Some(user)) => {
+                info!("Found existing user {} with {} passkeys", username, user.passkeys.len());
+                Some(user.passkeys.into_iter().map(|sk| sk.cred_id().clone()).collect())
+            }
+            Ok(None) => {
+                info!("No existing user found for {}", username);
+                None
+            }
+            Err(e) => {
+                error!("Failed to query user {}: {:?}", username, e);
+                return Err(WebauthnError::MongoDBError(e));
+            }
+        }
     };
 
     let res = match app_state.webauthn.start_passkey_registration(
@@ -96,155 +49,137 @@ pub async fn start_register(
         exclude_credentials,
     ) {
         Ok((ccr, reg_state)) => {
-            // Note that due to the session store in use being a server side memory store, this is
-            // safe to store the reg_state into the session since it is not client controlled and
-            // not open to replay attacks. If this was a cookie store, this would be UNSAFE.
-            session
-                .insert("reg_state", (username, user_unique_id, reg_state))
-                .await
-                .expect("Failed to insert");
-            info!("Registration Successful!");
+            if let Err(e) = session.insert("reg_state", (username.clone(), user_unique_id, reg_state)).await {
+                error!("Failed to insert reg_state into session: {:?}", e);
+                return Err(WebauthnError::InvalidSessionState(e));
+            }
+            info!("Registration challenge generated for {} (UUID: {})", username, user_unique_id);
             Json(ccr)
         }
         Err(e) => {
-            info!("challenge_register -> {:?}", e);
+            error!("Failed to start passkey registration for {}: {:?}", username, e);
             return Err(WebauthnError::Unknown);
         }
     };
     Ok(res)
 }
-
-// 3. The browser has completed it's steps and the user has created a public key
-// on their device. Now we have the registration options sent to us, and we need
-// to verify these and persist them.
 
 pub async fn finish_register(
     Extension(app_state): Extension<AppState>,
     session: Session,
     Json(reg): Json<RegisterPublicKeyCredential>,
 ) -> Result<impl IntoResponse, WebauthnError> {
-    let (username, user_unique_id, reg_state) = match session.get("reg_state").await? {
-        Some((username, user_unique_id, reg_state)) => (username, user_unique_id, reg_state),
-        None => {
-            error!("Failed to get session");
-            return Err(WebauthnError::CorruptSession);
-        }
-    };
+    let (username, user_unique_id, reg_state): (String, Uuid, PasskeyRegistration) = session
+        .get("reg_state")
+        .await?
+        .ok_or_else(|| {
+            error!("No reg_state found in session for registration completion");
+            WebauthnError::CorruptSession
+        })?;
 
-    let _ = session.remove_value("reg_state").await;
+    if let Err(e) = session.remove_value("reg_state").await {
+        error!("Failed to remove reg_state from session: {:?}", e);
+    } else {
+        info!("Cleared reg_state from session for {}", username);
+    }
 
-    let res = match app_state
-        .webauthn
-        .finish_passkey_registration(&reg, &reg_state)
-    {
+    let res = match app_state.webauthn.finish_passkey_registration(&reg, &reg_state) {
         Ok(sk) => {
-            let mut users_guard = app_state.users.lock().await;
+            let collection = app_state.users_collection();
+            let user_data = UserData {
+                username: username.clone(),
+                unique_id: user_unique_id,
+                passkeys: vec![sk],
+            };
 
-            //TODO: This is where we would store the credential in a db, or persist them in some other way.
-            users_guard
-                .keys
-                .entry(user_unique_id)
-                .and_modify(|keys| keys.push(sk.clone()))
-                .or_insert_with(|| vec![sk.clone()]);
+            let update_doc = doc! { 
+                "$setOnInsert": { "unique_id": user_unique_id.to_string() }, 
+                "$push": { "passkeys": mongodb::bson::to_bson(&user_data.passkeys[0])? } 
+            };
+            info!("Attempting to upsert user {} with update: {:?}", username, update_doc);
 
-            users_guard.name_to_id.insert(username, user_unique_id);
-
-            StatusCode::OK
+            match collection
+                .update_one(
+                    doc! { "username": &username },
+                    update_doc,
+                )
+                .with_options(mongodb::options::UpdateOptions::builder().upsert(true).build())
+                .await
+            {
+                Ok(result) => {
+                    info!(
+                        "MongoDB update result: matched={}, modified={}, upserted_id={:?}",
+                        result.matched_count, result.modified_count, result.upserted_id
+                    );
+                    if result.upserted_id.is_some() {
+                        info!("Inserted new user {} (UUID: {}) into MongoDB", username, user_unique_id);
+                    } else if result.modified_count > 0 {
+                        info!("Appended passkey to existing user {} in MongoDB", username);
+                    } else {
+                        warn!("No changes made to MongoDB for user {} - possible issue", username);
+                    }
+                    StatusCode::OK
+                }
+                Err(e) => {
+                    error!("Failed to upsert user {} into MongoDB: {:?}", username, e);
+                    return Err(WebauthnError::MongoDBError(e));
+                }
+            }
         }
         Err(e) => {
-            error!("challenge_register -> {:?}", e);
+            error!("Failed to finish passkey registration for {}: {:?}", username, e);
             StatusCode::BAD_REQUEST
         }
     };
-
+    info!("Registration completed successfully for {}", username);
     Ok(res)
 }
-
-// 4. Now that our public key has been registered, we can authenticate a user and verify
-// that they are the holder of that security token. The work flow is similar to registration.
-//
-//          ┌───────────────┐     ┌───────────────┐      ┌───────────────┐
-//          │ Authenticator │     │    Browser    │      │     Site      │
-//          └───────────────┘     └───────────────┘      └───────────────┘
-//                  │                     │                      │
-//                  │                     │     1. Start Auth    │
-//                  │                     │─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─▶│
-//                  │                     │                      │
-//                  │                     │     2. Challenge     │
-//                  │                     │◀ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┤
-//                  │                     │                      │
-//                  │  3. Select Token    │                      │
-//             ─ ─ ─│◀ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─│                      │
-//  4. Verify │     │                     │                      │
-//                  │    4. Yield Sig     │                      │
-//            └ ─ ─▶│─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─▶                      │
-//                  │                     │    5. Send Auth      │
-//                  │                     │        Opts          │
-//                  │                     │─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─▶│─ ─ ─
-//                  │                     │                      │     │ 5. Verify
-//                  │                     │                      │          Sig
-//                  │                     │                      │◀─ ─ ┘
-//                  │                     │                      │
-//                  │                     │                      │
-//
-// The user indicates the wish to start authentication and we need to provide a challenge.
 
 pub async fn start_authentication(
     Extension(app_state): Extension<AppState>,
     session: Session,
     Path(username): Path<String>,
 ) -> Result<impl IntoResponse, WebauthnError> {
-    info!("Start Authentication");
-    // We get the username from the URL, but you could get this via form submission or
-    // some other process.
+    info!("Start authentication for username: {}", username);
 
-    // Remove any previous authentication that may have occured from the session.
-    let _ = session.remove_value("auth_state").await;
+    if let Err(e) = session.remove_value("auth_state").await {
+        error!("Failed to remove previous auth_state from session: {:?}", e);
+    } else {
+        info!("Cleared previous auth_state from session");
+    }
 
-    // Get the set of keys that the user possesses
-    let users_guard = app_state.users.lock().await;
+    let collection = app_state.users_collection();
+    let user_data = match collection.find_one(doc! { "username": &username }).await {
+        Ok(Some(user)) => {
+            info!("Found user {} with {} passkeys for authentication", username, user.passkeys.len());
+            user
+        }
+        Ok(None) => {
+            error!("No user found for {} during authentication", username);
+            return Err(WebauthnError::UserNotFound);
+        }
+        Err(e) => {
+            error!("Failed to query user {} for authentication: {:?}", username, e);
+            return Err(WebauthnError::MongoDBError(e));
+        }
+    };
 
-    // Look up their unique id from the username
-    let user_unique_id = users_guard
-        .name_to_id
-        .get(&username)
-        .copied()
-        .ok_or(WebauthnError::UserNotFound)?;
-
-    let allow_credentials = users_guard
-        .keys
-        .get(&user_unique_id)
-        .ok_or(WebauthnError::UserHasNoCredentials)?;
-
-    let res = match app_state
-        .webauthn
-        .start_passkey_authentication(allow_credentials)
-    {
+    let res = match app_state.webauthn.start_passkey_authentication(&user_data.passkeys) {
         Ok((rcr, auth_state)) => {
-            // Drop the mutex to allow the mut borrows below to proceed
-            drop(users_guard);
-
-            // Note that due to the session store in use being a server side memory store, this is
-            // safe to store the auth_state into the session since it is not client controlled and
-            // not open to replay attacks. If this was a cookie store, this would be UNSAFE.
-            session
-                .insert("auth_state", (user_unique_id, auth_state))
-                .await
-                .expect("Failed to insert");
+            if let Err(e) = session.insert("auth_state", (user_data.unique_id, auth_state)).await {
+                error!("Failed to insert auth_state into session: {:?}", e);
+                return Err(WebauthnError::InvalidSessionState(e));
+            }
+            info!("Authentication challenge generated for {} (UUID: {})", username, user_data.unique_id);
             Json(rcr)
         }
         Err(e) => {
-            info!("challenge_authenticate -> {:?}", e);
+            error!("Failed to start passkey authentication for {}: {:?}", username, e);
             return Err(WebauthnError::Unknown);
         }
     };
     Ok(res)
 }
-
-// 5. The browser and user have completed their part of the processing. Only in the
-// case that the webauthn authenticate call returns Ok, is authentication considered
-// a success. If the browser does not complete this call, or *any* error occurs,
-// this is an authentication failure.
 
 pub async fn finish_authentication(
     Extension(app_state): Extension<AppState>,
@@ -254,37 +189,62 @@ pub async fn finish_authentication(
     let (user_unique_id, auth_state): (Uuid, PasskeyAuthentication) = session
         .get("auth_state")
         .await?
-        .ok_or(WebauthnError::CorruptSession)?;
+        .ok_or_else(|| {
+            error!("No auth_state found in session for authentication completion");
+            WebauthnError::CorruptSession
+        })?;
 
-    let _ = session.remove_value("auth_state").await;
+    if let Err(e) = session.remove_value("auth_state").await {
+        error!("Failed to remove auth_state from session: {:?}", e);
+    } else {
+        info!("Cleared auth_state from session for UUID: {}", user_unique_id);
+    }
 
-    let res = match app_state
-        .webauthn
-        .finish_passkey_authentication(&auth, &auth_state)
-    {
+    let res = match app_state.webauthn.finish_passkey_authentication(&auth, &auth_state) {
         Ok(auth_result) => {
-            let mut users_guard = app_state.users.lock().await;
+            let collection = app_state.users_collection();
+            let user = match collection.find_one(doc! { "unique_id": user_unique_id.to_string() }).await {
+                Ok(Some(user)) => {
+                    info!("Found user with UUID {} for authentication update", user_unique_id);
+                    user
+                }
+                Ok(None) => {
+                    error!("No user found with UUID {} during authentication update", user_unique_id);
+                    return Err(WebauthnError::UserHasNoCredentials);
+                }
+                Err(e) => {
+                    error!("Failed to query user with UUID {}: {:?}", user_unique_id, e);
+                    return Err(WebauthnError::MongoDBError(e));
+                }
+            };
 
-            // Update the credential counter, if possible.
-            users_guard
-                .keys
-                .get_mut(&user_unique_id)
-                .map(|keys| {
-                    keys.iter_mut().for_each(|sk| {
-                        // This will update the credential if it's the matching
-                        // one. Otherwise it's ignored. That is why it is safe to
-                        // iterate this over the full list.
-                        sk.update_credential(&auth_result);
-                    })
-                })
-                .ok_or(WebauthnError::UserHasNoCredentials)?;
-            StatusCode::OK
+            let mut user_data = user;
+            for sk in user_data.passkeys.iter_mut() {
+                sk.update_credential(&auth_result);
+            }
+
+            match collection
+                .update_one(
+                    doc! { "unique_id": user_unique_id.to_string() },
+                    doc! { "$set": { "passkeys": mongodb::bson::to_bson(&user_data.passkeys)? } },
+                )
+                .await
+            {
+                Ok(_) => {
+                    info!("Updated passkeys for user with UUID {} in MongoDB", user_unique_id);
+                    StatusCode::OK
+                }
+                Err(e) => {
+                    error!("Failed to update passkeys for UUID {} in MongoDB: {:?}", user_unique_id, e);
+                    return Err(WebauthnError::MongoDBError(e));
+                }
+            }
         }
         Err(e) => {
-            info!("challenge_register -> {:?}", e);
+            error!("Failed to finish passkey authentication for UUID {}: {:?}", user_unique_id, e);
             StatusCode::BAD_REQUEST
         }
     };
-    info!("Authentication Successful!");
+    info!("Authentication completed successfully for UUID {}", user_unique_id);
     Ok(res)
 }

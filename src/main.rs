@@ -33,7 +33,6 @@ compile_error!("Feature \"javascript\" and feature \"wasm\" cannot be enabled at
 // =======
 // Below is glue/stubs that are needed to make the above work, but don't really affect
 // the work flow too much.
-
 #[tokio::main]
 async fn main() {
     if std::env::var("RUST_LOG").is_err() {
@@ -43,7 +42,7 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     // Create the app
-    let app_state = AppState::new();
+    let app_state = AppState::new().await;
 
     let session_store = MemoryStore::default();
 
@@ -54,21 +53,21 @@ async fn main() {
     .allow_origin("http://localhost:3000".parse::<axum::http::HeaderValue>().unwrap()) // Specific origin
     .allow_credentials(true); // Allow credentials (cookies)
 
-let app = Router::new()
-    .route("/register_start/:username", post(start_register))
-    .route("/register_finish", post(finish_register))
-    .route("/login_start/:username", post(start_authentication))
-    .route("/login_finish", post(finish_authentication))
-    .layer(Extension(app_state))
-    .layer(
-        SessionManagerLayer::new(session_store)
-            .with_name("webauthnrs")
-            .with_same_site(SameSite::Strict)
-            .with_secure(false)
-            .with_expiry(Expiry::OnInactivity(Duration::seconds(360))),
-    )
-    .layer(cors) // Add the CORS layer
-    .fallback(handler_404);
+    let app = Router::new()
+        .route("/register_start/:username", post(start_register))
+        .route("/register_finish", post(finish_register))
+        .route("/login_start/:username", post(start_authentication))
+        .route("/login_finish", post(finish_authentication))
+        .layer(Extension(app_state))
+        .layer(
+            SessionManagerLayer::new(session_store)
+                .with_name("webauthnrs")
+                .with_same_site(SameSite::Strict)
+                .with_secure(false)
+                .with_expiry(Expiry::OnInactivity(Duration::seconds(360))),
+        )
+        .layer(cors) // Add the CORS layer
+        .fallback(handler_404);
 
     #[cfg(feature = "wasm")]
     if !PathBuf::from("./assets/wasm").exists() {
@@ -98,5 +97,5 @@ let app = Router::new()
 }
 
 async fn handler_404() -> impl IntoResponse {
-    (StatusCode::NOT_FOUND, "nothing to see here")
+    (StatusCode::NOT_FOUND, "Nothing to see here")
 }
