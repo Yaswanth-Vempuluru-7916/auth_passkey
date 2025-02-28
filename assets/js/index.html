@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebAuthn Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .container {
+            display: flex;
+            gap: 20px;
+        }
+        .panel {
+            flex: 1;
+            padding: 20px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+        }
+        button {
+            padding: 10px;
+            margin: 5px 0;
+            width: 100%;
+            cursor: pointer;
+        }
+        input {
+            padding: 8px;
+            margin: 5px 0;
+            width: 100%;
+            box-sizing: border-box;
+        }
+        pre {
+            background-color: #f5f5f5;
+            padding: 10px;
+            border-radius: 5px;
+            overflow: auto;
+            max-height: 300px;
+        }
+        .debug-info {
+            margin-top: 20px;
+            padding: 10px;
+            background-color: #f0f8ff;
+            border: 1px solid #add8e6;
+            border-radius: 5px;
+        }
+    </style>
+</head>
+<body>
+    <h1>WebAuthn Testing</h1>
+    
+    <div class="container">
+        <div class="panel">
+            <h2>Registration</h2>
+            <input type="text" id="reg-username" placeholder="Username">
+            <button id="register-button">Register Key</button>
+            <h3>Status</h3>
+            <pre id="reg-status">Not started</pre>
+        </div>
+        
+        <div class="panel">
+            <h2>Authentication</h2>
+            <input type="text" id="auth-username" placeholder="Username">
+            <button id="authenticate-button">Authenticate</button>
+            <h3>Status</h3>
+            <pre id="auth-status">Not started</pre>
+        </div>
+    </div>
+
+    <div class="debug-info">
+        <h2>Debug Information</h2>
+        <div>
+            <button id="test-post">Test Simple POST</button>
+            <pre id="test-result">Not tested</pre>
+        </div>
+        <div>
+            <button id="list-routes">List Available Routes</button>
+            <pre id="routes-result">Not tested</pre>
+        </div>
+    </div>
+
+    <h2>Log</h2>
+    <pre id="log"></pre>
+
+    <script>
+        // Helper to log messages
+        function log(message) {
+            const logElement = document.getElementById('log');
+            const timestamp = new Date().toISOString().split('T')[1].split('.')[0];
+            logElement.textContent = `[${timestamp}] ${message}\n` + logElement.textContent;
+            console.log(`[${timestamp}] ${message}`);
+        }
+
+        // Helper to update status
+        function updateStatus(element, message) {
+            document.getElementById(element).textContent = message;
+        }
+
+        // Debug: Test simple POST request
+        document.getElementById('test-post').addEventListener('click', async () => {
+            try {
+                updateStatus('test-result', 'Testing POST request...');
+                
+                const response = await fetch('/test_post', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ test: 'data' })
+                });
+                
+                const statusText = `Status: ${response.status} ${response.statusText}`;
+                const headers = Array.from(response.headers.entries())
+                    .map(([key, value]) => `${key}: ${value}`)
+                    .join('\n');
+                
+                let responseText;
+                try {
+                    responseText = await response.text();
+                } catch (e) {
+                    responseText = '(no response body)';
+                }
+                
+                updateStatus('test-result', `${statusText}\n\nHeaders:\n${headers}\n\nResponse:\n${responseText}`);
+                log(`Test POST result: ${statusText}`);
+            } catch (error) {
+                updateStatus('test-result', `Error: ${error.message}`);
+                log(`Test POST error: ${error.message}`);
+            }
+        });
+
+        // Debug: List available routes
+        document.getElementById('list-routes').addEventListener('click', async () => {
+            try {
+                updateStatus('routes-result', 'Checking available routes...');
+                
+                // Try requesting the endpoints with OPTIONS to see what's available
+                const routes = [
+                    '/register_start/test',
+                    '/register_finish',
+                    '/login_start/test',
+                    '/login_finish'
+                ];
+                
+                const results = [];
+                
+                for (const route of routes) {
+                    try {
+                        const response = await fetch(route, { method: 'OPTIONS' });
+                        const allowHeader = response.headers.get('Allow') || 'No Allow header';
+                        results.push(`${route}: ${response.status} ${response.statusText}, Allow: ${allowHeader}`);
+                    } catch (e) {
+                        results.push(`${route}: Error - ${e.message}`);
+                    }
+                }
+                
+                updateStatus('routes-result', results.join('\n'));
+                log(`Routes check completed`);
+            } catch (error) {
+                updateStatus('routes-result', `Error: ${error.message}`);
+                log(`Routes check error: ${error.message}`);
+            }
+        });
+
+        // Base64 URL utilities
+        function base64UrlToBuffer(base64Url) {
+            const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+            const padding = '='.repeat((4 - (base64.length % 4)) % 4);
+            const base64Padded = base64 + padding;
+            const binary = atob(base64Padded);
+            const buffer = new Uint8Array(binary.length);
+            
+            for (let i = 0; i < binary.length; i++) {
+                buffer[i] = binary.charCodeAt(i);
+            }
+            
+            return buffer;
+        }
+
+        function bufferToBase64Url(buffer) {
+            const binary = String.fromCharCode(...new Uint8Array(buffer));
+            const base64 = btoa(binary);
+            return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+        }
+
+        // =============== REGISTRATION ===============
+        document.getElementById('register-button').addEventListener('click', async () => {
+            const username = document.getElementById('reg-username').value.trim();
+            
+            if (!username) {
+                alert('Please enter a username');
+                return;
+            }
+            
+            try {
+                updateStatus('reg-status', 'Starting registration...');
+                log(`Starting registration for user: ${username}`);
+                log(`Sending POST request to: /register_start/${username}`);
+                
+                // Step 1: Request challenge from server
+                const challengeResponse = await fetch(`/register_start/${username}`, {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({}) // Send empty body for POST request
+                });
+                
+                log(`Server response status: ${challengeResponse.status} ${challengeResponse.statusText}`);
+                
+                if (!challengeResponse.ok) {
+                    const errorText = await challengeResponse.text();
+                    throw new Error(`Server returned ${challengeResponse.status}: ${errorText}`);
+                }
+                
+                const challengeData = await challengeResponse.json();
+                log(`Received registration challenge: ${JSON.stringify(challengeData, null, 2)}`);
+                updateStatus('reg-status', 'Received challenge from server, creating credential...');
+                
+                // Step 2: Convert server response for the browser's navigator.credentials.create
+                const publicKeyCredentialCreationOptions = {
+                    challenge: base64UrlToBuffer(challengeData.public_key.challenge),
+                    rp: {
+                        name: challengeData.public_key.rp.name,
+                        id: challengeData.public_key.rp.id
+                    },
+                    user: {
+                        id: base64UrlToBuffer(challengeData.public_key.user.id),
+                        name: challengeData.public_key.user.name,
+                        displayName: challengeData.public_key.user.display_name
+                    },
+                    pubKeyCredParams: challengeData.public_key.pub_key_cred_params,
+                    timeout: challengeData.public_key.timeout,
+                    attestation: challengeData.public_key.attestation,
+                    authenticatorSelection: challengeData.public_key.authenticator_selection
+                };
+                
+                if (challengeData.public_key.exclude_credentials) {
+                    publicKeyCredentialCreationOptions.excludeCredentials = 
+                        challengeData.public_key.exclude_credentials.map(credential => ({
+                            id: base64UrlToBuffer(credential.id),
+                            type: credential.type,
+                            transports: credential.transports
+                        }));
+                }
+                
+                // Step 3: Create the credential
+                const credential = await navigator.credentials.create({
+                    publicKey: publicKeyCredentialCreationOptions
+                });
+                
+                log('Credential created by browser');
+                updateStatus('reg-status', 'Credential created, sending to server...');
+                
+                // Step 4: Format the credential for the server
+                const clientDataJSON = bufferToBase64Url(credential.response.clientDataJSON);
+                const attestationObject = bufferToBase64Url(credential.response.attestationObject);
+                
+                const registrationResponse = {
+                    id: credential.id,
+                    raw_id: bufferToBase64Url(credential.rawId),
+                    response: {
+                        client_data_json: clientDataJSON,
+                        attestation_object: attestationObject
+                    },
+                    type: credential.type
+                };
+                
+                log(`Sending POST request to: /register_finish`);
+                log(`Request payload: ${JSON.stringify(registrationResponse)}`);
+                
+                // Step 5: Send the credential to the server
+                const verificationResponse = await fetch('/register_finish', {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(registrationResponse)
+                });
+                
+                log(`Server response status: ${verificationResponse.status} ${verificationResponse.statusText}`);
+                
+                if (!verificationResponse.ok) {
+                    const errorText = await verificationResponse.text();
+                    throw new Error(`Server returned ${verificationResponse.status}: ${errorText}`);
+                }
+                
+                log('Registration successful!');
+                updateStatus('reg-status', 'Registration successful!');
+                
+            } catch (error) {
+                log(`Registration error: ${error.message}`);
+                updateStatus('reg-status', `Error: ${error.message}`);
+                console.error('Registration error:', error);
+            }
+        });
+
+        // =============== AUTHENTICATION ===============
+        document.getElementById('authenticate-button').addEventListener('click', async () => {
+            const username = document.getElementById('auth-username').value.trim();
+            
+            if (!username) {
+                alert('Please enter a username');
+                return;
+            }
+            
+            try {
+                updateStatus('auth-status', 'Starting authentication...');
+                log(`Starting authentication for user: ${username}`);
+                log(`Sending POST request to: /login_start/${username}`);
+                
+                // Step 1: Request challenge from server
+                const challengeResponse = await fetch(`/login_start/${username}`, {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({}) // Send empty body for POST request
+                });
+                
+                log(`Server response status: ${challengeResponse.status} ${challengeResponse.statusText}`);
+                
+                if (!challengeResponse.ok) {
+                    const errorText = await challengeResponse.text();
+                    throw new Error(`Server returned ${challengeResponse.status}: ${errorText}`);
+                }
+                
+                const challengeData = await challengeResponse.json();
+                log(`Received authentication challenge: ${JSON.stringify(challengeData, null, 2)}`);
+                updateStatus('auth-status', 'Received challenge from server, getting credential...');
+                
+                // Step 2: Convert server response for the browser's navigator.credentials.get
+                const publicKeyCredentialRequestOptions = {
+                    challenge: base64UrlToBuffer(challengeData.public_key.challenge),
+                    timeout: challengeData.public_key.timeout,
+                    rpId: challengeData.public_key.rp_id,
+                    userVerification: challengeData.public_key.user_verification
+                };
+                
+                if (challengeData.public_key.allow_credentials) {
+                    publicKeyCredentialRequestOptions.allowCredentials = 
+                        challengeData.public_key.allow_credentials.map(credential => ({
+                            id: base64UrlToBuffer(credential.id),
+                            type: credential.type,
+                            transports: credential.transports
+                        }));
+                }
+                
+                // Step 3: Get the credential
+                const credential = await navigator.credentials.get({
+                    publicKey: publicKeyCredentialRequestOptions
+                });
+                
+                log('Credential retrieved by browser');
+                updateStatus('auth-status', 'Credential retrieved, sending to server...');
+                
+                // Step 4: Format the credential for the server
+                const authData = bufferToBase64Url(credential.response.authenticatorData);
+                const clientDataJSON = bufferToBase64Url(credential.response.clientDataJSON);
+                const signature = bufferToBase64Url(credential.response.signature);
+                let userHandle = null;
+                
+                if (credential.response.userHandle) {
+                    userHandle = bufferToBase64Url(credential.response.userHandle);
+                }
+                
+                const authenticationResponse = {
+                    id: credential.id,
+                    raw_id: bufferToBase64Url(credential.rawId),
+                    response: {
+                        authenticator_data: authData,
+                        client_data_json: clientDataJSON,
+                        signature: signature
+                    },
+                    type: credential.type
+                };
+                
+                if (userHandle) {
+                    authenticationResponse.response.user_handle = userHandle;
+                }
+                
+                log(`Sending POST request to: /login_finish`);
+                log(`Request payload: ${JSON.stringify(authenticationResponse)}`);
+                
+                // Step 5: Send the credential to the server
+                const verificationResponse = await fetch('/login_finish', {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(authenticationResponse)
+                });
+                
+                log(`Server response status: ${verificationResponse.status} ${verificationResponse.statusText}`);
+                
+                if (!verificationResponse.ok) {
+                    const errorText = await verificationResponse.text();
+                    throw new Error(`Server returned ${verificationResponse.status}: ${errorText}`);
+                }
+                
+                log('Authentication successful!');
+                updateStatus('auth-status', 'Authentication successful!');
+                
+            } catch (error) {
+                log(`Authentication error: ${error.message}`);
+                updateStatus('auth-status', `Error: ${error.message}`);
+                console.error('Authentication error:', error);
+            }
+        });
+    </script>
+</body>
+</html>
