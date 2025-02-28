@@ -19,7 +19,9 @@ pub enum WebauthnError {
     #[error("MongoDB error: {0}")]
     MongoDBError(#[from] mongodb::error::Error),
     #[error("BSON serialization error: {0}")]
-    BsonError(#[from] mongodb::bson::ser::Error), // Add this
+    BsonError(#[from] mongodb::bson::ser::Error),
+    #[error("UUID parsing error: {0}")]
+    UuidError(#[from] mongodb::bson::uuid::Error), // Add this
 }
 
 impl IntoResponse for WebauthnError {
@@ -32,6 +34,7 @@ impl IntoResponse for WebauthnError {
             WebauthnError::InvalidSessionState(_) => "Deserialising Session failed",
             WebauthnError::MongoDBError(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
             WebauthnError::BsonError(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            WebauthnError::UuidError(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };
         (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
     }

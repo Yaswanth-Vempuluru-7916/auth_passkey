@@ -38,20 +38,17 @@ async fn main() {
     if std::env::var("RUST_LOG").is_err() {
         std::env::set_var("RUST_LOG", "INFO");
     }
-    // initialize tracing
     tracing_subscriber::fmt::init();
 
-    // Create the app
     let app_state = AppState::new().await;
 
     let session_store = MemoryStore::default();
 
-    // build our application with a route
     let cors = CorsLayer::new()
-    .allow_methods([Method::GET, Method::POST])
-    .allow_headers(vec![header::CONTENT_TYPE]) // Explicitly allow Content-Type
-    .allow_origin("http://localhost:3000".parse::<axum::http::HeaderValue>().unwrap()) // Specific origin
-    .allow_credentials(true); // Allow credentials (cookies)
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers(vec![header::CONTENT_TYPE])
+        .allow_origin("http://localhost:3000".parse::<axum::http::HeaderValue>().unwrap())
+        .allow_credentials(true);
 
     let app = Router::new()
         .route("/register_start/:username", post(start_register))
@@ -66,12 +63,12 @@ async fn main() {
                 .with_secure(false)
                 .with_expiry(Expiry::OnInactivity(Duration::seconds(360))),
         )
-        .layer(cors) // Add the CORS layer
+        .layer(cors)
         .fallback(handler_404);
 
     #[cfg(feature = "wasm")]
     if !PathBuf::from("./assets/wasm").exists() {
-        panic!("Can't find WASM files to serve!")
+        panic!("Can't find WASM files to serve!");
     }
 
     #[cfg(feature = "wasm")]
@@ -84,8 +81,6 @@ async fn main() {
         .merge(app)
         .nest_service("/", tower_http::services::ServeDir::new("assets/js"));
 
-    // run our app with hyper
-    // `axum::Server` is a re-export of `hyper::Server`
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
     info!("listening on {addr}");
 

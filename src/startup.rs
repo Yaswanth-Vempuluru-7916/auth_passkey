@@ -3,15 +3,30 @@ use webauthn_rs::prelude::*;
 use mongodb::{Client, Database};
 use serde::{Serialize, Deserialize};
 use dotenv::dotenv;
-use tracing::info; // Import tracing macros correctly
-use uuid::Uuid; // Ensure Uuid is imported
-
+use tracing::info;
+use uuid::Uuid;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UserData {
     pub username: String,
+    #[serde(deserialize_with = "deserialize_uuid", serialize_with = "serialize_uuid")]
     pub unique_id: Uuid,
     pub passkeys: Vec<Passkey>,
+}
+
+fn deserialize_uuid<'de, D>(deserializer: D) -> Result<Uuid, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s: String = Deserialize::deserialize(deserializer)?;
+    Uuid::parse_str(&s).map_err(serde::de::Error::custom)
+}
+
+fn serialize_uuid<S>(uuid: &Uuid, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&uuid.to_string())
 }
 
 #[derive(Clone)]
